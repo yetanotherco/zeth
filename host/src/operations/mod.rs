@@ -16,7 +16,7 @@ pub mod build;
 pub mod rollups;
 pub mod snarks;
 
-use std::fmt::Debug;
+use std::{fmt::Debug, fs::File, io::Write};
 
 use bonsai_sdk::alpha::responses::SnarkReceipt;
 use log::{debug, error, info, warn};
@@ -24,7 +24,7 @@ use risc0_zkvm::{
     compute_image_id,
     serde::to_vec,
     sha::{Digest, Digestible},
-    Assumption, ExecutorEnv, ExecutorImpl, Receipt, Segment, SegmentRef,
+    Assumption, ExecutorEnv, ExecutorImpl, MaybePruned, Receipt, Segment, SegmentRef,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use zeth_primitives::keccak::keccak;
@@ -77,7 +77,15 @@ pub async fn stark2snark(
         }
     };
 
-    let stark_psd = stark_receipt.get_claim()?.post.digest();
+    let claim = stark_receipt.claim()?;
+
+    let stark_psd = match claim {
+        MaybePruned::Value(val) => val.post.digest(),
+        MaybePruned::Pruned(_) => {
+            panic!("Pruned receipt not supported")
+        }
+    };
+
     let snark_psd = Digest::try_from(snark_receipt.post_state_digest.as_slice())?;
 
     if stark_psd != snark_psd {
@@ -251,15 +259,34 @@ pub async fn maybe_prove<I: Serialize, O: Eq + Debug + Serialize + DeserializeOw
             .expect("Failed to upload cached receipt to Bonsai");
     }
 
-    let result = (receipt_uuid, receipt);
+    let result = (receipt_uuid, receipt.clone());
 
     // save receipt
     if !cached {
         save_receipt(&receipt_label, &result);
+        let receipt_bytes = bincode::serialize(&receipt).expect("Failed to serialize receipt");
+        save_to_file(
+            receipt_bytes.as_slice(),
+            format!("{}.proof", receipt_label).as_str(),
+        )
+        .expect("Failed to save receipt file");
+        save_to_file(elf, format!("{}.elf", receipt_label).as_str())
+            .expect("Failed to save elf file");
+        save_to_file(
+            receipt.journal.bytes.as_slice(),
+            format!("{}.pub", receipt_label).as_str(),
+        )
+        .expect("Failed to save public input file");
     }
 
     // return result
     Some(result)
+}
+
+pub fn save_to_file(bytes: &[u8], path: &str) -> Result<(), std::io::Error> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 pub async fn upload_receipt(receipt: &Receipt) -> anyhow::Result<String> {
@@ -332,7 +359,7 @@ pub fn prove_locally(
         let mut exec = ExecutorImpl::from_elf(env, elf).unwrap();
         exec.run().unwrap()
     };
-    session.prove().unwrap()
+    session.prove().unwrap().receipt
 }
 
 const NULL_SEGMENT_REF: NullSegmentRef = NullSegmentRef {};
